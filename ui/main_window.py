@@ -18,8 +18,8 @@ from PySide6.QtGui import QColor, QKeySequence, QShortcut, QPixmap
 from ui.playback_bar import PlaybackBar
 
 from core.database import Database
-from ui.settings_dialog import NamingFormatDialog
-from core.converter import convert_to_aiff, retag_aif_file
+from ui.settings_dialog import SettingsDialog
+from core.converter import convert_audio, retag_file, FORMAT_EXTENSION
 from core.detector import read_source_tags, parse_filename_tags, detect_bpm, detect_key
 from core.organizer import (
     CATEGORIES, FILE_EXTENSION,
@@ -46,7 +46,7 @@ class RetagWorker(QThread):
         total = len(self._jobs)
         ok = fail = 0
         for i, (path, meta) in enumerate(self._jobs):
-            success, _ = retag_aif_file(path, meta)
+            success, _ = retag_file(path, meta)
             if success:
                 ok += 1
             else:
@@ -150,9 +150,10 @@ class ConvertWorker(QThread):
             if not self._running:
                 break
             self.progress.emit(job["queue_index"], "Converting…")
-            ok, err = convert_to_aiff(
+            ok, err = convert_audio(
                 job["source_path"],
                 job["target_path"],
+                out_format=job.get("out_format", "aif"),
                 metadata=job.get("metadata"),
             )
             self.progress.emit(job["queue_index"], "Done" if ok else f"Error: {err[:40]}")
@@ -251,6 +252,7 @@ class MainWindow(QMainWindow):
             json.loads(saved_tokens) if saved_tokens else list(DEFAULT_FORMAT_TOKENS)
         )
         self._format_separator: str = self.db.get_setting("naming_separator", DEFAULT_SEPARATOR)
+        self._output_format: str = self.db.get_setting("output_format", "aif")
         self._undo_stack = _UndoStack()
 
         self._apply_style()
@@ -354,7 +356,7 @@ class MainWindow(QMainWindow):
         btn.clicked.connect(self._pick_library)
         tb.addWidget(btn)
 
-        naming_btn = QPushButton("Naming Format…")
+        naming_btn = QPushButton("Settings")
         naming_btn.clicked.connect(self._open_naming_settings)
         tb.addWidget(naming_btn)
 
@@ -774,20 +776,24 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage(f"Library set: {path}", 5000)
 
     def _open_naming_settings(self):
-        dlg = NamingFormatDialog(
+        dlg = SettingsDialog(
             current_tokens=self._format_tokens,
             current_separator=self._format_separator,
+            current_format=self._output_format,
             parent=self,
         )
         dlg.format_saved.connect(self._on_format_saved)
         dlg.exec()
 
-    def _on_format_saved(self, tokens: list, separator: str):
+    def _on_format_saved(self, tokens: list, separator: str, out_format: str):
         self._format_tokens = tokens
         self._format_separator = separator
+        self._output_format = out_format
         self.db.save_setting("naming_tokens", json.dumps(tokens))
         self.db.save_setting("naming_separator", separator)
-        self.status_bar.showMessage("Naming format saved.", 4000)
+        self.db.save_setting("output_format", out_format)
+        fmt_label = {"aif": "AIFF", "wav": "WAV", "flac": "FLAC"}.get(out_format, out_format.upper())
+        self.status_bar.showMessage(f"Settings saved — output format: {fmt_label}", 4000)
 
     def _retag_library(self):
         """Rewrite ID3 tags on every .aif file in the library from DB records."""
@@ -1416,6 +1422,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "No Library", "Please set a library folder first.")
             return
 
+        ext = FORMAT_EXTENSION.get(self._output_format, ".aif")
         jobs = []
         for idx, item in enumerate(self.import_queue):
             if item["status"] != "Ready":
@@ -1423,7 +1430,7 @@ class MainWindow(QMainWindow):
             raw_target = get_target_path(
                 self.library_root,
                 item["category"],
-                item["name"] + FILE_EXTENSION,
+                item["name"] + ext,
                 label_subfolder=self._label_subfolder_for(item),
             )
             target = unique_path(raw_target)
@@ -1431,6 +1438,7 @@ class MainWindow(QMainWindow):
                 "queue_index": idx,
                 "source_path": item["source_path"],
                 "target_path": str(target),
+                "out_format":  self._output_format,
                 "metadata": {
                     "name":     item["name"],
                     "category": item["category"],
