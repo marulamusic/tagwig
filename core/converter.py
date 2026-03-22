@@ -39,9 +39,11 @@ def _write_id3_tags(path: str, metadata: dict):
     """
     try:
         audio = AIFF(path)
-        # Always start clean — removes stale TXXX/TCON from old format
-        audio.delete_tags()
-        audio.add_tags()
+        if audio.tags is None:
+            audio.add_tags()
+        else:
+            # Clear all existing frames so stale TXXX/old TCON don't linger
+            audio.tags.clear()
         tags = audio.tags
 
         if metadata.get("name"):
