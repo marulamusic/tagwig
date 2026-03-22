@@ -9,22 +9,65 @@ from PySide6.QtWidgets import (
     QLabel, QPushButton, QLineEdit, QComboBox, QFileDialog,
     QHeaderView, QAbstractItemView, QMessageBox, QSpinBox,
     QToolBar, QStatusBar, QCheckBox, QSlider, QFrame, QGridLayout,
-    QListWidget, QListWidgetItem, QMenu,
+    QListWidget, QListWidgetItem, QMenu, QDialog, QDialogButtonBox,
+    QScrollArea,
 )
 from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtGui import QColor, QKeySequence, QShortcut
+from PySide6.QtGui import QColor, QKeySequence, QShortcut, QPixmap
 
 from ui.playback_bar import PlaybackBar
 
 from core.database import Database
 from ui.settings_dialog import NamingFormatDialog
 from core.converter import convert_to_aiff
+from core.detector import read_source_tags, parse_filename_tags, detect_bpm, detect_key
 from core.organizer import (
     CATEGORIES, FILE_EXTENSION,
     get_target_path, unique_path, ensure_library_structure,
     build_filename_from_format, count_existing_files,
     DEFAULT_FORMAT_TOKENS, DEFAULT_SEPARATOR,
 )
+
+
+# ── Background BPM / Key detection worker ─────────────────────────────────────
+
+class DetectionWorker(QThread):
+    """
+    Runs BPM and key detection in a background thread for a batch of files.
+
+    For each item:
+      - BPM analysis is only run when item type is 'Loop' AND bpm == 0
+      - Key analysis is run whenever key is empty
+
+    Emits detected(row_idx, bpm, key) as results arrive.
+    bpm == -1 means "no BPM detected / not applicable".
+    key == "" means "no key detected".
+    """
+
+    detected = Signal(int, int, str)   # (row_idx, bpm, key)
+
+    def __init__(self, jobs: list[tuple], parent=None):
+        """jobs: list of (row_idx, path, item_type, needs_bpm, needs_key)"""
+        super().__init__(parent)
+        self._jobs = jobs
+
+    def run(self):
+        for row_idx, path, item_type, needs_bpm, needs_key in self._jobs:
+            bpm_result = -1
+            key_result = ""
+
+            if needs_bpm and item_type.lower() == "loop":
+                val = detect_bpm(path)
+                if val is not None:
+                    bpm_result = val
+
+            if needs_key:
+                val = detect_key(path)
+                if val:
+                    key_result = val
+
+            if bpm_result != -1 or key_result:
+                self.detected.emit(row_idx, bpm_result, key_result)
 
 
 # ── Undo / Redo stack ─────────────────────────────────────────────────────────
@@ -166,8 +209,15 @@ class MainWindow(QMainWindow):
         self.library_root: str = self.db.get_setting("library_root", "")
         self.import_queue: list[dict] = []
         self.worker: ConvertWorker | None = None
+        self._detect_worker: DetectionWorker | None = None
         self._pending_jobs: dict[int, dict] = {}
         self._block_name_sync = False
+
+        # Custom tags (user-editable, persisted to DB)
+        saved_custom = self.db.get_setting("custom_tags", "")
+        self._custom_tags: list[str] = (
+            json.loads(saved_custom) if saved_custom else list(self.DEFAULT_CUSTOM_TAGS)
+        )
 
         # Naming format — loaded from DB, editable via Settings dialog
         saved_tokens = self.db.get_setting("naming_tokens", "")
@@ -259,6 +309,21 @@ class MainWindow(QMainWindow):
     def _build_toolbar(self):
         tb = QToolBar()
         tb.setMovable(False)
+
+        # Marula Music logo
+        logo_path = Path(__file__).parent.parent / "assets" / "marula_logo.png"
+        if logo_path.exists():
+            logo_lbl = QLabel()
+            pix = QPixmap(str(logo_path))
+            pix = pix.scaledToHeight(28, Qt.SmoothTransformation)
+            logo_lbl.setPixmap(pix)
+            logo_lbl.setContentsMargins(4, 0, 10, 0)
+            tb.addWidget(logo_lbl)
+            sep = QFrame()
+            sep.setFrameShape(QFrame.VLine)
+            sep.setStyleSheet("color: #333;")
+            tb.addWidget(sep)
+
         btn = QPushButton("Set Library Folder")
         btn.clicked.connect(self._pick_library)
         tb.addWidget(btn)
@@ -445,6 +510,14 @@ class MainWindow(QMainWindow):
         ["glide",    "mono",     "poly",     "chord"   ],
     ]
 
+    # Default custom tags shown below the Bitwig grid (user-editable via settings)
+    DEFAULT_CUSTOM_TAGS = [
+        "808", "909", "707", "cr78",
+        "detuned", "electric", "layered", "metallic",
+        "noisy", "wet", "mod", "fx",
+        "harmonic", "distorted", "pitched", "lofi",
+    ]
+
     def _build_tag_editor(self):
         widget = QWidget()
         layout = QVBoxLayout(widget)
@@ -462,21 +535,9 @@ class MainWindow(QMainWindow):
         self.gen_name_btn.setToolTip("Build Bitwig-friendly filename using the active naming format")
         self.gen_name_btn.clicked.connect(self._generate_name)
 
-        self.apply_all_btn = QPushButton("Apply to All")
-        self.apply_all_btn.setFixedWidth(100)
-        self.apply_all_btn.setEnabled(False)
-        self.apply_all_btn.clicked.connect(self._apply_to_all)
-
-        self.apply_btn = QPushButton("Apply to Selected")
-        self.apply_btn.setFixedWidth(130)
-        self.apply_btn.setEnabled(False)
-        self.apply_btn.clicked.connect(self._apply_to_selected)
-
         header_row.addWidget(lbl)
         header_row.addStretch()
         header_row.addWidget(self.gen_name_btn)
-        header_row.addWidget(self.apply_all_btn)
-        header_row.addWidget(self.apply_btn)
         layout.addLayout(header_row)
 
         # ── Main fields row ───────────────────────────────────────────────────
@@ -490,11 +551,13 @@ class MainWindow(QMainWindow):
         left.addWidget(self._field_label("Name"))
         self.name_edit = QLineEdit()
         self.name_edit.setPlaceholderText("e.g.  kick  or  dark-kick")
+        self.name_edit.editingFinished.connect(self._on_editor_name_finished)
         left.addWidget(self.name_edit)
 
         left.addWidget(self._field_label("Tags  (comma separated)"))
         self.tags_edit = QLineEdit()
         self.tags_edit.setPlaceholderText("e.g.  dark, punchy, 909, analogue")
+        self.tags_edit.editingFinished.connect(self._on_editor_tags_finished)
         left.addWidget(self.tags_edit)
         left.addStretch()
         fields.addLayout(left, 3)
@@ -526,6 +589,7 @@ class MainWindow(QMainWindow):
         self.bpm_spin.setRange(0, 300)
         self.bpm_spin.setSpecialValueText("—")
         self.bpm_spin.setFixedWidth(72)
+        self.bpm_spin.editingFinished.connect(self._on_editor_bpm_finished)
         bpm_col.addWidget(self.bpm_spin)
         meta.addLayout(bpm_col)
 
@@ -535,14 +599,23 @@ class MainWindow(QMainWindow):
         self.key_edit = QLineEdit()
         self.key_edit.setPlaceholderText("e.g. Am")
         self.key_edit.setFixedWidth(72)
+        self.key_edit.editingFinished.connect(self._on_editor_key_finished)
         key_col.addWidget(self.key_edit)
         meta.addLayout(key_col)
         meta.addStretch()
         right.addLayout(meta)
 
-        right.addWidget(self._field_label("Label  (pack creator / publisher)"))
+        right.addWidget(self._field_label("Group / Label"))
         self.label_edit = QLineEdit()
-        self.label_edit.setPlaceholderText("e.g.  Loopmasters, Splice, ADSR")
+        self.label_edit.setPlaceholderText("e.g.  808, Loopmasters, Vintage")
+        self.label_edit.setToolTip(
+            "Used as a subfolder name inside the category folder.\n"
+            "Bitwig reads subfolder names as custom browsable tags —\n"
+            "so  Kicks/808/file.aif  will show '808' in Bitwig's tag browser.\n\n"
+            "Use this for drum machine models (808, 909, 707), pack names,\n"
+            "or any grouping you want to filter by in Bitwig."
+        )
+        self.label_edit.editingFinished.connect(self._on_editor_label_finished)
         right.addWidget(self.label_edit)
 
         _chk_css = """
@@ -551,11 +624,12 @@ class MainWindow(QMainWindow):
             QCheckBox::indicator:unchecked { background: #2a2a2a; border: 1px solid #444; }
             QCheckBox::indicator:checked   { background: #C86000; border: 1px solid #E07010; }
         """
-        self.label_subfolder_check = QCheckBox("Create label subfolders")
+        self.label_subfolder_check = QCheckBox("Create group subfolder  (enables Bitwig tag)")
         self.label_subfolder_check.setStyleSheet(_chk_css)
         self.label_subfolder_check.setToolTip(
-            "Places files in  Category / Label /  instead of  Category /\n"
-            "Numbering restarts from 0001 per label subfolder."
+            "Places files in  Category / Group /  instead of  Category /\n"
+            "The subfolder name becomes a custom tag in Bitwig's browser.\n"
+            "Numbering restarts from 0001 per group subfolder."
         )
         right.addWidget(self.label_subfolder_check)
         right.addStretch()
@@ -594,12 +668,39 @@ class MainWindow(QMainWindow):
             for c, tag in enumerate(row_tags):
                 btn = QPushButton(tag)
                 btn.setCheckable(True)
-                btn.setFocusPolicy(Qt.NoFocus)   # never steal focus from the queue table
+                btn.setFocusPolicy(Qt.NoFocus)
                 btn.setStyleSheet(tag_btn_css)
                 btn.toggled.connect(lambda checked, t=tag: self._on_bitwig_tag_toggled(t, checked))
                 self._bitwig_tag_btns[tag] = btn
                 grid.addWidget(btn, r, c)
         layout.addLayout(grid)
+
+        # ── Custom tags ───────────────────────────────────────────────────────
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet("color: #2e2e2e; margin-top: 4px; margin-bottom: 2px;")
+        layout.addWidget(sep)
+
+        custom_header = QHBoxLayout()
+        custom_lbl = QLabel("CUSTOM TAGS")
+        custom_lbl.setStyleSheet("color: #555; font-size: 11px; font-weight: bold; letter-spacing: 1px;")
+        edit_custom_btn = QPushButton("Edit…")
+        edit_custom_btn.setFixedWidth(52)
+        edit_custom_btn.setFocusPolicy(Qt.NoFocus)
+        edit_custom_btn.setStyleSheet("""
+            QPushButton { font-size: 11px; padding: 2px 6px; }
+        """)
+        edit_custom_btn.clicked.connect(self._open_custom_tags_dialog)
+        custom_header.addWidget(custom_lbl)
+        custom_header.addStretch()
+        custom_header.addWidget(edit_custom_btn)
+        layout.addLayout(custom_header)
+
+        self._custom_tag_btns: dict[str, QPushButton] = {}
+        self._custom_grid = QGridLayout()
+        self._custom_grid.setSpacing(5)
+        self._rebuild_custom_tag_grid()
+        layout.addLayout(self._custom_grid)
 
         return widget
 
@@ -734,32 +835,80 @@ class MainWindow(QMainWindow):
 
     def _on_files_dropped(self, paths: list[str]):
         existing = {item["source_path"] for item in self.import_queue}
-        added = 0
+        added_indices: list[int] = []
+
         for path in paths:
             if path in existing:
                 continue
             p = Path(path)
+
+            # ── Fast metadata extraction (synchronous) ─────────────────────
+            meta = read_source_tags(path)
+            fn_meta = parse_filename_tags(p.name)
+            bpm = meta.get("bpm") or fn_meta.get("bpm") or 0
+            key = meta.get("key") or fn_meta.get("key") or ""
+
             item = {
                 "source_path": path,
                 "name": p.stem,
                 "category": "Uncategorised",
                 "type": "—",
                 "tags": "",
-                "bpm": 0,
-                "key": "",
+                "bpm": bpm,
+                "key": key,
                 "label": "",
                 "status": "Ready",
             }
             idx = len(self.import_queue)
             self.import_queue.append(item)
             self._append_table_row(idx, item)
-            added += 1
+            added_indices.append(idx)
 
-        if added:
+        if added_indices:
             self._update_import_btn()
-            self.apply_all_btn.setEnabled(True)
             self.gen_name_btn.setEnabled(True)
             self._update_status()
+            self._launch_detection_worker(added_indices)
+
+    def _launch_detection_worker(self, indices: list[int]):
+        """Kick off background BPM/key analysis for rows that still need it."""
+        jobs = []
+        for idx in indices:
+            item = self.import_queue[idx]
+            needs_bpm = item["bpm"] == 0
+            needs_key = item["key"] == ""
+            if needs_bpm or needs_key:
+                jobs.append((idx, item["source_path"], item["type"], needs_bpm, needs_key))
+        if not jobs:
+            return
+
+        # Cancel previous worker if still running
+        if self._detect_worker and self._detect_worker.isRunning():
+            self._detect_worker.quit()
+
+        self._detect_worker = DetectionWorker(jobs)
+        self._detect_worker.detected.connect(self._on_detection_result)
+        self._detect_worker.start()
+
+    def _on_detection_result(self, row_idx: int, bpm: int, key: str):
+        """Called from background thread when BPM/key analysis finishes for a file."""
+        if row_idx >= len(self.import_queue):
+            return
+        item = self.import_queue[row_idx]
+        if bpm != -1 and item["bpm"] == 0:
+            item["bpm"] = bpm
+        if key and not item["key"]:
+            item["key"] = key
+
+        # Update the editor fields if this row is currently selected
+        selected = self._selected_rows()
+        if selected and selected[0] == row_idx:
+            self._block_name_sync = True
+            if bpm != -1 and bpm > 0:
+                self.bpm_spin.setValue(bpm)
+            if key:
+                self.key_edit.setText(key)
+            self._block_name_sync = False
 
     def _append_table_row(self, idx: int, item: dict):
         self._block_name_sync = True
@@ -837,8 +986,6 @@ class MainWindow(QMainWindow):
         self.import_queue.clear()
         self.queue_table.setRowCount(0)
         self._pending_jobs.clear()
-        self.apply_btn.setEnabled(False)
-        self.apply_all_btn.setEnabled(False)
         self.gen_name_btn.setEnabled(False)
         self._update_import_btn()
         self._update_status()
@@ -848,9 +995,7 @@ class MainWindow(QMainWindow):
     def _on_selection_changed(self):
         rows = sorted({i.row() for i in self.queue_table.selectedItems()})
         if not rows:
-            self.apply_btn.setEnabled(False)
             return
-        self.apply_btn.setEnabled(True)
         item = self.import_queue[rows[0]]
         self._block_name_sync = True
         self.name_edit.setText(item["name"])
@@ -891,7 +1036,8 @@ class MainWindow(QMainWindow):
         self._undo_stack.push(before, self._snapshot(rows))
 
     def _on_editor_type_changed(self, text: str):
-        """Propagate type change to ALL selected rows immediately."""
+        """Propagate type change to ALL selected rows immediately.
+        If set to Loop, kick off BPM detection for rows that don't have one yet."""
         if self._block_name_sync:
             return
         rows = self._selected_rows()
@@ -900,6 +1046,80 @@ class MainWindow(QMainWindow):
         before = self._snapshot(rows)
         for row in rows:
             self.import_queue[row]["type"] = text
+        self._undo_stack.push(before, self._snapshot(rows))
+
+        # If type just became Loop, run BPM detection on rows still missing it
+        if text.lower() == "loop":
+            self._launch_detection_worker(rows)
+
+    def _on_editor_name_finished(self):
+        """Apply name field to the single selected row (name is per-file)."""
+        if self._block_name_sync:
+            return
+        rows = self._selected_rows()
+        if len(rows) != 1:
+            return
+        name = self.name_edit.text().strip()
+        if not name:
+            return
+        before = self._snapshot(rows)
+        self.import_queue[rows[0]]["name"] = name
+        self._block_name_sync = True
+        self.queue_table.item(rows[0], 2).setText(name)
+        self._block_name_sync = False
+        self._undo_stack.push(before, self._snapshot(rows))
+
+    def _on_editor_tags_finished(self):
+        """Propagate tags field to ALL selected rows."""
+        if self._block_name_sync:
+            return
+        rows = self._selected_rows()
+        if not rows:
+            return
+        value = self.tags_edit.text().strip()
+        before = self._snapshot(rows)
+        for row in rows:
+            self.import_queue[row]["tags"] = value
+        self._sync_bitwig_buttons(value)
+        self._undo_stack.push(before, self._snapshot(rows))
+
+    def _on_editor_bpm_finished(self):
+        """Propagate BPM to ALL selected rows."""
+        if self._block_name_sync:
+            return
+        rows = self._selected_rows()
+        if not rows:
+            return
+        value = self.bpm_spin.value()
+        before = self._snapshot(rows)
+        for row in rows:
+            self.import_queue[row]["bpm"] = value
+        self._undo_stack.push(before, self._snapshot(rows))
+
+    def _on_editor_key_finished(self):
+        """Propagate key field to ALL selected rows."""
+        if self._block_name_sync:
+            return
+        rows = self._selected_rows()
+        if not rows:
+            return
+        value = self.key_edit.text().strip()
+        before = self._snapshot(rows)
+        for row in rows:
+            self.import_queue[row]["key"] = value
+        self._undo_stack.push(before, self._snapshot(rows))
+
+    def _on_editor_label_finished(self):
+        """Propagate label field to ALL selected rows."""
+        if self._block_name_sync:
+            return
+        rows = self._selected_rows()
+        if not rows:
+            return
+        value = self.label_edit.text().strip()
+        before = self._snapshot(rows)
+        for row in rows:
+            self.import_queue[row]["label"] = value
         self._undo_stack.push(before, self._snapshot(rows))
 
     def _on_bitwig_tag_toggled(self, tag: str, checked: bool):
@@ -920,10 +1140,84 @@ class MainWindow(QMainWindow):
         # Return focus to the queue so arrow keys keep navigating
         self.queue_table.setFocus()
 
+    def _rebuild_custom_tag_grid(self):
+        """Clear and repopulate the custom tag button grid from self._custom_tags."""
+        # Remove old buttons
+        while self._custom_grid.count():
+            item = self._custom_grid.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self._custom_tag_btns.clear()
+
+        tag_btn_css = """
+            QPushButton {
+                background: #222; color: #777; border: 1px solid #3a3a3a;
+                border-radius: 4px; padding: 3px 10px; font-size: 12px;
+            }
+            QPushButton:hover   { border-color: #666; color: #aaa; }
+            QPushButton:checked {
+                background: #1A3A00; color: #7EC820;
+                border-color: #4A8800;
+            }
+        """
+        cols = 4
+        for i, tag in enumerate(self._custom_tags):
+            btn = QPushButton(tag)
+            btn.setCheckable(True)
+            btn.setFocusPolicy(Qt.NoFocus)
+            btn.setStyleSheet(tag_btn_css)
+            btn.toggled.connect(lambda checked, t=tag: self._on_bitwig_tag_toggled(t, checked))
+            self._custom_tag_btns[tag] = btn
+            self._custom_grid.addWidget(btn, i // cols, i % cols)
+
+    def _open_custom_tags_dialog(self):
+        """Open a simple dialog to edit the custom tag list."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Edit Custom Tags")
+        dlg.setMinimumWidth(420)
+        dlg.setStyleSheet(self.styleSheet())
+        layout = QVBoxLayout(dlg)
+        layout.setSpacing(10)
+
+        lbl = QLabel("Enter custom tags, one per line.\n"
+                      "These appear in Bitwig's tag browser below the standard 16 tags.")
+        lbl.setStyleSheet("color: #999; font-size: 12px;")
+        lbl.setWordWrap(True)
+        layout.addWidget(lbl)
+
+        from PySide6.QtWidgets import QPlainTextEdit
+        text_edit = QPlainTextEdit()
+        text_edit.setPlaceholderText("808\n909\ndetuned\nwet\n...")
+        text_edit.setPlainText("\n".join(self._custom_tags))
+        text_edit.setStyleSheet(
+            "QPlainTextEdit { background: #2a2a2a; border: 1px solid #444; "
+            "border-radius: 4px; color: #e0e0e0; padding: 6px; font-size: 13px; }"
+        )
+        layout.addWidget(text_edit)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.setStyleSheet("QPushButton { min-width: 80px; }")
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        layout.addWidget(btns)
+
+        if dlg.exec() == QDialog.Accepted:
+            tags = [t.strip().lower() for t in text_edit.toPlainText().splitlines() if t.strip()]
+            # Deduplicate while preserving order
+            seen: set[str] = set()
+            unique = [t for t in tags if not (t in seen or seen.add(t))]
+            self._custom_tags = unique
+            self.db.save_setting("custom_tags", json.dumps(unique))
+            self._rebuild_custom_tag_grid()
+
     def _sync_bitwig_buttons(self, tags_text: str):
-        """Reflect tags_text in the Bitwig quick-tag button states."""
+        """Reflect tags_text in both the Bitwig and custom quick-tag button states."""
         active = {t.strip().lower() for t in tags_text.split(",") if t.strip()}
         for tag, btn in self._bitwig_tag_btns.items():
+            btn.blockSignals(True)
+            btn.setChecked(tag.lower() in active)
+            btn.blockSignals(False)
+        for tag, btn in self._custom_tag_btns.items():
             btn.blockSignals(True)
             btn.setChecked(tag.lower() in active)
             btn.blockSignals(False)
