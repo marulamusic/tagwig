@@ -6,7 +6,7 @@ from ui.main_window import MainWindow
 
 def main():
     app = QApplication(sys.argv)
-    app.setApplicationName("Sample Tool")
+    app.setApplicationName("TagWig")
     app.setOrganizationName("MarulaMusic")
     app.setStyle("Fusion")
 

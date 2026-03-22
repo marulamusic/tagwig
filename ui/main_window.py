@@ -156,10 +156,10 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Sample Tool")
+        self.setWindowTitle("TagWig")
         self.resize(1280, 860)
 
-        db_dir = Path.home() / ".sampletool"
+        db_dir = Path.home() / ".tagwig"
         db_dir.mkdir(exist_ok=True)
         self.db = Database(str(db_dir / "library.db"))
 
