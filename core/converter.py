@@ -33,11 +33,15 @@ def convert_to_aiff(input_path: str, output_path: str, metadata: dict | None = N
 
 
 def _write_id3_tags(path: str, metadata: dict):
-    """Embed ID3 tags into an AIFF file."""
+    """
+    Embed ID3 tags into an AIFF file.
+    Clears any existing tags first so old frames don't linger.
+    """
     try:
         audio = AIFF(path)
-        if audio.tags is None:
-            audio.add_tags()
+        # Always start clean — removes stale TXXX/TCON from old format
+        audio.delete_tags()
+        audio.add_tags()
         tags = audio.tags
 
         if metadata.get("name"):
@@ -49,9 +53,9 @@ def _write_id3_tags(path: str, metadata: dict):
         if metadata.get("label"):
             tags.add(TPUB(encoding=3, text=metadata["label"]))
 
-        # Write custom tags to TCON (Genre) — this is what Bitwig reads for its
-        # tag browser. Category is already encoded in the folder structure, so we
-        # only put the user's custom descriptors here.
+        # Write custom tags to TCON — Bitwig reads subfolder names as custom
+        # browsable tags, but TCON is also read for the standard 16 character tags.
+        # Put all user tags here so both standard and custom Bitwig tags work.
         if metadata.get("tags"):
             tcon_values = [t.strip() for t in metadata["tags"].split(",") if t.strip()]
             if tcon_values:
@@ -60,3 +64,18 @@ def _write_id3_tags(path: str, metadata: dict):
         audio.save()
     except Exception as e:
         print(f"ID3 tag write error: {e}")
+
+
+def retag_aif_file(path: str, metadata: dict) -> tuple[bool, str]:
+    """
+    Rewrite ID3 tags on an already-converted .aif file without re-converting audio.
+    Use this to update existing library files to the current tag format.
+    Returns (success, error_message).
+    """
+    try:
+        if not Path(path).exists():
+            return False, f"File not found: {path}"
+        _write_id3_tags(path, metadata)
+        return True, ""
+    except Exception as e:
+        return False, str(e)

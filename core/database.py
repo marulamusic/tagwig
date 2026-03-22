@@ -55,6 +55,11 @@ class Database:
         ))
         self.conn.commit()
 
+    def get_all_samples(self) -> list[dict]:
+        """Return every sample record as a list of dicts."""
+        rows = self.conn.execute("SELECT * FROM samples").fetchall()
+        return [dict(r) for r in rows]
+
     def get_setting(self, key, default=None):
         row = self.conn.execute(
             "SELECT value FROM settings WHERE key = ?", (key,)

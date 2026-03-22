@@ -19,7 +19,7 @@ from ui.playback_bar import PlaybackBar
 
 from core.database import Database
 from ui.settings_dialog import NamingFormatDialog
-from core.converter import convert_to_aiff
+from core.converter import convert_to_aiff, retag_aif_file
 from core.detector import read_source_tags, parse_filename_tags, detect_bpm, detect_key
 from core.organizer import (
     CATEGORIES, FILE_EXTENSION,
@@ -27,6 +27,32 @@ from core.organizer import (
     build_filename_from_format, count_existing_files,
     DEFAULT_FORMAT_TOKENS, DEFAULT_SEPARATOR,
 )
+
+
+# ── Background re-tag worker ──────────────────────────────────────────────────
+
+class RetagWorker(QThread):
+    """Rewrites ID3 tags on all .aif files in the library from the DB records."""
+
+    progress = Signal(int, int, str)   # (done, total, current_file)
+    finished = Signal(int, int)        # (success_count, fail_count)
+
+    def __init__(self, jobs: list[tuple], parent=None):
+        """jobs: list of (library_path, metadata_dict)"""
+        super().__init__(parent)
+        self._jobs = jobs
+
+    def run(self):
+        total = len(self._jobs)
+        ok = fail = 0
+        for i, (path, meta) in enumerate(self._jobs):
+            success, _ = retag_aif_file(path, meta)
+            if success:
+                ok += 1
+            else:
+                fail += 1
+            self.progress.emit(i + 1, total, Path(path).name)
+        self.finished.emit(ok, fail)
 
 
 # ── Background BPM / Key detection worker ─────────────────────────────────────
@@ -331,6 +357,15 @@ class MainWindow(QMainWindow):
         naming_btn = QPushButton("Naming Format…")
         naming_btn.clicked.connect(self._open_naming_settings)
         tb.addWidget(naming_btn)
+
+        retag_btn = QPushButton("Re-tag Library")
+        retag_btn.setToolTip(
+            "Rewrites ID3 tags on every .aif file already in your library\n"
+            "using the latest tag format (fixes files imported with older versions).\n"
+            "Requires a Bitwig library rescan afterwards."
+        )
+        retag_btn.clicked.connect(self._retag_library)
+        tb.addWidget(retag_btn)
         tb.addSeparator()
 
         self.library_label = QLabel(
@@ -753,6 +788,63 @@ class MainWindow(QMainWindow):
         self.db.save_setting("naming_tokens", json.dumps(tokens))
         self.db.save_setting("naming_separator", separator)
         self.status_bar.showMessage("Naming format saved.", 4000)
+
+    def _retag_library(self):
+        """Rewrite ID3 tags on every .aif file in the library from DB records."""
+        if not self.library_root:
+            QMessageBox.warning(self, "No Library", "Set a library folder first.")
+            return
+
+        # Build job list from all .aif files found on disk, matched to DB records
+        samples = self.db.get_all_samples()
+        jobs = []
+        missing = 0
+        for s in samples:
+            p = Path(s.get("library_path", ""))
+            if p.exists() and p.suffix.lower() in (".aif", ".aiff"):
+                meta = {
+                    "name":     s.get("name", ""),
+                    "tags":     s.get("tags", ""),
+                    "bpm":      s.get("bpm", 0),
+                    "key":      s.get("key", ""),
+                    "label":    s.get("label", ""),
+                    "category": s.get("category", ""),
+                }
+                jobs.append((str(p), meta))
+            else:
+                missing += 1
+
+        if not jobs:
+            QMessageBox.information(self, "Re-tag Library",
+                "No library files found in the database.\n"
+                "Import files first so TagWig knows their metadata.")
+            return
+
+        reply = QMessageBox.question(
+            self, "Re-tag Library",
+            f"This will rewrite ID3 tags on {len(jobs)} file(s) in your library\n"
+            f"({missing} DB records had no matching file on disk).\n\n"
+            "Continue?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        self._retag_worker = RetagWorker(jobs, parent=self)
+        self._retag_worker.progress.connect(
+            lambda done, total, name: self.status_bar.showMessage(
+                f"Re-tagging {done}/{total}: {name}"
+            )
+        )
+        self._retag_worker.finished.connect(self._on_retag_finished)
+        self._retag_worker.start()
+        self.status_bar.showMessage(f"Re-tagging {len(jobs)} files…")
+
+    def _on_retag_finished(self, ok: int, fail: int):
+        self.status_bar.showMessage(
+            f"Re-tag complete — {ok} updated, {fail} failed. "
+            "Rescan your library in Bitwig to pick up the new tags.", 10000
+        )
 
     def _refresh_tree(self):
         self.library_tree.clear()
