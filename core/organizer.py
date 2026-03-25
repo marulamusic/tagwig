@@ -55,7 +55,10 @@ CATEGORIES = {
 }
 
 
-FILE_EXTENSION = ".aif"
+FILE_EXTENSION = ".aif"   # legacy default; callers should use FORMAT_EXTENSION
+
+# All audio extensions TagWig may produce (for counting / globbing)
+_AUDIO_EXTENSIONS = (".aif", ".aiff", ".wav", ".flac")
 
 
 def get_target_path(library_root: str, category: str, filename: str,
@@ -93,7 +96,7 @@ def count_existing_files(library_root: str, category: str,
         folder = folder / label_subfolder
     if not folder.exists():
         return 0
-    return len(list(folder.glob(f"*{FILE_EXTENSION}")))
+    return sum(len(list(folder.glob(f"*{ext}"))) for ext in _AUDIO_EXTENSIONS)
 
 
 DEFAULT_FORMAT_TOKENS = ["number", "name", "tags", "bpm", "key"]
@@ -152,11 +155,11 @@ def build_filename_from_format(
             if lbl:
                 parts.append(lbl)
 
-    return separator.join(p for p in parts if p) + FILE_EXTENSION
+    return separator.join(p for p in parts if p)
 
 
 def build_filename(name: str, tags: str, bpm: int, key: str, number: int = 0) -> str:
-    """Legacy wrapper — uses the default format."""
+    """Legacy wrapper — uses the default format. Returns stem only (no extension)."""
     return build_filename_from_format(
         tokens=DEFAULT_FORMAT_TOKENS,
         separator=DEFAULT_SEPARATOR,

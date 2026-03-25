@@ -1,7 +1,21 @@
 import json
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 from datetime import datetime
+
+
+def _resource_path(relative: str) -> Path:
+    """Return absolute path to a bundled resource.
+
+    Works both when running from source (relative to the project root) and
+    when frozen by PyInstaller (resources are unpacked to sys._MEIPASS).
+    """
+    if hasattr(sys, "_MEIPASS"):
+        return Path(sys._MEIPASS) / relative
+    # Running from source — project root is two levels up from this file
+    return Path(__file__).parent.parent / relative
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
@@ -53,6 +67,31 @@ class RetagWorker(QThread):
                 fail += 1
             self.progress.emit(i + 1, total, Path(path).name)
         self.finished.emit(ok, fail)
+
+
+# ── Background library re-tag worker ─────────────────────────────────────────
+
+class _LibraryRetagWorker(QThread):
+    """Rewrites ID3/Vorbis tags on a specific list of library files."""
+
+    finished = Signal(int)   # number of files successfully retagged
+    error    = Signal(str)   # error message on unexpected failure
+
+    def __init__(self, jobs: list[tuple], parent=None):
+        """jobs: list of (library_path, metadata_dict)"""
+        super().__init__(parent)
+        self._jobs = jobs
+
+    def run(self):
+        try:
+            ok = 0
+            for path, meta in self._jobs:
+                success, _ = retag_file(path, meta)
+                if success:
+                    ok += 1
+            self.finished.emit(ok)
+        except Exception as exc:
+            self.error.emit(str(exc))
 
 
 # ── Background BPM / Key detection worker ─────────────────────────────────────
@@ -229,8 +268,15 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("TagWig")
         self.resize(1280, 860)
 
-        db_dir = Path.home() / ".tagwig"
-        db_dir.mkdir(exist_ok=True)
+        import os
+        if sys.platform == "win32":
+            _base = os.environ.get("APPDATA") or (Path.home() / "AppData/Roaming")
+            db_dir = Path(_base) / "TagWig"
+        elif sys.platform == "darwin":
+            db_dir = Path.home() / "Library/Application Support/TagWig"
+        else:
+            db_dir = Path.home() / ".tagwig"
+        db_dir.mkdir(parents=True, exist_ok=True)
         self.db = Database(str(db_dir / "library.db"))
 
         self.library_root: str = self.db.get_setting("library_root", "")
@@ -253,6 +299,7 @@ class MainWindow(QMainWindow):
         )
         self._format_separator: str = self.db.get_setting("naming_separator", DEFAULT_SEPARATOR)
         self._output_format: str = self.db.get_setting("output_format", "aif")
+        self._force_id3_tags: bool = self.db.get_setting("force_id3_tags", "1") == "1"
         self._undo_stack = _UndoStack()
 
         self._apply_style()
@@ -339,7 +386,7 @@ class MainWindow(QMainWindow):
         tb.setMovable(False)
 
         # Marula Music logo
-        logo_path = Path(__file__).parent.parent / "assets" / "marula_logo.png"
+        logo_path = _resource_path("assets/marula_logo.png")
         if logo_path.exists():
             logo_lbl = QLabel()
             pix = QPixmap(str(logo_path))
@@ -447,6 +494,7 @@ class MainWindow(QMainWindow):
         file_layout.addWidget(self._section_header("Files in folder"))
 
         self.file_list = QListWidget()
+        self.file_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.file_list.setStyleSheet("""
             QListWidget { background-color: #1e1e1e; border: none; }
             QListWidget::item { padding: 3px 10px; color: #aaa; font-size: 12px; }
@@ -456,6 +504,7 @@ class MainWindow(QMainWindow):
         self.file_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.file_list.customContextMenuRequested.connect(self._on_file_list_context_menu)
         self.file_list.itemClicked.connect(self._on_file_list_clicked)
+        self.file_list.itemDoubleClicked.connect(self._on_file_list_double_clicked)
         file_layout.addWidget(self.file_list)
         v_split.addWidget(file_pane)
 
@@ -547,12 +596,12 @@ class MainWindow(QMainWindow):
         ["glide",    "mono",     "poly",     "chord"   ],
     ]
 
-    # Default custom tags shown below the Bitwig grid (user-editable via settings)
+    # Default custom quick-tag buttons (user-editable, no vocabulary restriction)
     DEFAULT_CUSTOM_TAGS = [
         "808", "909", "707", "cr78",
         "detuned", "electric", "layered", "metallic",
         "noisy", "wet", "mod", "fx",
-        "harmonic", "distorted", "pitched", "lofi",
+        "harmonic", "lofi", "sub", "heavy",
     ]
 
     def _build_tag_editor(self):
@@ -780,18 +829,22 @@ class MainWindow(QMainWindow):
             current_tokens=self._format_tokens,
             current_separator=self._format_separator,
             current_format=self._output_format,
+            custom_tags=list(self._custom_tags),
+            force_id3_tags=self._force_id3_tags,
             parent=self,
         )
         dlg.format_saved.connect(self._on_format_saved)
         dlg.exec()
 
-    def _on_format_saved(self, tokens: list, separator: str, out_format: str):
+    def _on_format_saved(self, tokens: list, separator: str, out_format: str, force_id3: bool):
         self._format_tokens = tokens
         self._format_separator = separator
         self._output_format = out_format
+        self._force_id3_tags = force_id3
         self.db.save_setting("naming_tokens", json.dumps(tokens))
         self.db.save_setting("naming_separator", separator)
         self.db.save_setting("output_format", out_format)
+        self.db.save_setting("force_id3_tags", "1" if force_id3 else "0")
         fmt_label = {"aif": "AIFF", "wav": "WAV", "flac": "FLAC"}.get(out_format, out_format.upper())
         self.status_bar.showMessage(f"Settings saved — output format: {fmt_label}", 4000)
 
@@ -898,6 +951,11 @@ class MainWindow(QMainWindow):
         if path:
             self.playback_bar.load_file(path)
 
+    def _on_file_list_double_clicked(self, list_item: QListWidgetItem):
+        paths = [i.data(Qt.UserRole) for i in self.file_list.selectedItems() if i.data(Qt.UserRole)]
+        if paths:
+            self._open_library_edit_dialog(paths)
+
     def _on_tree_context_menu(self, pos):
         item = self.library_tree.itemAt(pos)
         path = item.data(0, Qt.UserRole) if item else self.library_root
@@ -913,21 +971,299 @@ class MainWindow(QMainWindow):
         menu.exec(self.library_tree.viewport().mapToGlobal(pos))
 
     def _on_file_list_context_menu(self, pos):
+        selected = [i.data(Qt.UserRole) for i in self.file_list.selectedItems() if i.data(Qt.UserRole)]
         item = self.file_list.itemAt(pos)
-        if not item:
+        if not item and not selected:
             return
-        path = item.data(Qt.UserRole)
+        path = (item.data(Qt.UserRole) if item else None) or (selected[0] if selected else None)
         if not path:
             return
+
         menu = QMenu(self)
         menu.setStyleSheet("""
             QMenu { background: #2a2a2a; border: 1px solid #3a3a3a; color: #e0e0e0; }
             QMenu::item:selected { background: #7A3A00; }
         """)
-        act = menu.addAction("Open in Finder")
-        # Reveal the file itself (not just the folder)
-        act.triggered.connect(lambda: subprocess.Popen(["open", "-R", path]))
+
+        paths_to_edit = selected if selected else [path]
+        label = f"Edit Tags…" if len(paths_to_edit) == 1 else f"Edit Tags for {len(paths_to_edit)} files…"
+        edit_act = menu.addAction(label)
+        edit_act.triggered.connect(lambda: self._open_library_edit_dialog(paths_to_edit))
+
+        menu.addSeparator()
+        finder_act = menu.addAction("Reveal in Finder")
+        finder_act.triggered.connect(lambda: subprocess.Popen(["open", "-R", path]))
         menu.exec(self.file_list.viewport().mapToGlobal(pos))
+
+    # ── Library tag editing ───────────────────────────────────────────────────
+
+    def _open_library_edit_dialog(self, paths: list[str]):
+        """Open an edit-tags dialog for one or more already-imported library files."""
+        from PySide6.QtWidgets import QPlainTextEdit
+
+        # Look up DB records for all paths
+        records = []
+        for p in paths:
+            row = self.db.get_sample_by_path(p)
+            records.append(row)  # may be None if not in DB
+
+        # Determine initial field values.
+        # For multi-select: show shared value if all agree, else blank (mixed).
+        def _shared(field, default=""):
+            vals = [r[field] for r in records if r and r.get(field) is not None]
+            if not vals:
+                return default
+            return vals[0] if len(set(str(v) for v in vals)) == 1 else ""
+
+        init_name  = _shared("name")  if len(paths) == 1 else ""
+        init_cat   = _shared("category", "Uncategorised")
+        init_tags  = _shared("tags",  "")
+        init_bpm   = _shared("bpm",   0)
+        init_key   = _shared("key",   "")
+        init_label = _shared("label", "")
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Edit Tags" if len(paths) == 1 else f"Edit Tags — {len(paths)} files")
+        dlg.setMinimumWidth(500)
+        dlg.setStyleSheet(self.styleSheet())
+        layout = QVBoxLayout(dlg)
+        layout.setSpacing(10)
+        layout.setContentsMargins(16, 16, 16, 16)
+
+        menu_style = """
+            QMenu { background: #2a2a2a; border: 1px solid #3a3a3a; color: #e0e0e0; }
+            QMenu::item:selected { background: #7A3A00; }
+        """
+
+        def _lbl(text):
+            l = QLabel(text)
+            l.setStyleSheet("color: #666; font-size: 11px; font-weight: bold; letter-spacing: 0.5px;")
+            return l
+
+        def _field(placeholder="", value=""):
+            f = QLineEdit()
+            f.setPlaceholderText(placeholder)
+            f.setText(str(value) if value else "")
+            f.setStyleSheet(
+                "QLineEdit { background: #2a2a2a; border: 1px solid #444; border-radius: 4px;"
+                " color: #e0e0e0; padding: 5px 8px; font-size: 13px; }"
+                "QLineEdit:focus { border-color: #C86000; }"
+            )
+            return f
+
+        # File path info
+        if len(paths) == 1:
+            info = QLabel(Path(paths[0]).name)
+            info.setStyleSheet("color: #555; font-size: 11px;")
+            info.setWordWrap(True)
+            layout.addWidget(info)
+        else:
+            info = QLabel(f"{len(paths)} files selected")
+            info.setStyleSheet("color: #555; font-size: 11px;")
+            layout.addWidget(info)
+
+        # Name (single file only)
+        if len(paths) == 1:
+            layout.addWidget(_lbl("NAME"))
+            name_edit = _field("filename stem", init_name)
+            layout.addWidget(name_edit)
+        else:
+            name_edit = None
+
+        # Category
+        layout.addWidget(_lbl("CATEGORY"))
+        cat_combo = QComboBox()
+        cat_combo.addItems(list(CATEGORIES.keys()))
+        if init_cat in CATEGORIES:
+            cat_combo.setCurrentText(init_cat)
+        cat_combo.setStyleSheet(
+            "QComboBox { background: #2a2a2a; border: 1px solid #444; border-radius: 4px;"
+            " color: #e0e0e0; padding: 5px 8px; font-size: 13px; }"
+            "QComboBox:focus { border-color: #C86000; }"
+            "QComboBox::drop-down { border: none; width: 20px; }"
+            "QComboBox QAbstractItemView { background: #2a2a2a; color: #e0e0e0;"
+            " selection-background-color: #7A3A00; border: 1px solid #3a3a3a; }"
+        )
+        layout.addWidget(cat_combo)
+
+        # Tags
+        layout.addWidget(_lbl("TAGS"))
+        tags_edit = _field("dark, punchy, 909, …", init_tags)
+        layout.addWidget(tags_edit)
+
+        # Bitwig quick-tag buttons
+        def _make_tag_grid(tags_list, cols=4):
+            grid_w = QWidget()
+            grid = QGridLayout(grid_w)
+            grid.setSpacing(4)
+            grid.setContentsMargins(0, 0, 0, 0)
+            btns = {}
+            btn_css = """
+                QPushButton { background:#222; color:#777; border:1px solid #3a3a3a;
+                    border-radius:4px; padding:3px 8px; font-size:11px; }
+                QPushButton:hover { border-color:#666; color:#aaa; }
+                QPushButton:checked { background:#1A3A00; color:#7EC820; border-color:#4A8800; }
+            """
+            for i, tag in enumerate(tags_list):
+                b = QPushButton(tag)
+                b.setCheckable(True)
+                b.setFocusPolicy(Qt.NoFocus)
+                b.setStyleSheet(btn_css)
+                btns[tag] = b
+                grid.addWidget(b, i // cols, i % cols)
+            return grid_w, btns
+
+        def _sync_btns(btns_dict, text):
+            active = {t.strip().lower() for t in text.split(",") if t.strip()}
+            for tag, btn in btns_dict.items():
+                btn.blockSignals(True)
+                btn.setChecked(tag.lower() in active)
+                btn.blockSignals(False)
+
+        def _on_tag_toggled(tag, checked, edit_field, btns_dict):
+            current = [t.strip() for t in edit_field.text().split(",") if t.strip()]
+            if checked and tag not in current:
+                current.append(tag)
+            elif not checked and tag in current:
+                current.remove(tag)
+            edit_field.setText(", ".join(current))
+            _sync_btns(btns_dict, edit_field.text())
+
+        # Bitwig grid
+        all_bw_tags = [t for row in self.BITWIG_TAGS for t in row]
+        bw_grid_w, bw_btns = _make_tag_grid(all_bw_tags, cols=4)
+        layout.addWidget(bw_grid_w)
+
+        # Custom tags
+        if self._custom_tags:
+            custom_grid_w, custom_btns = _make_tag_grid(self._custom_tags, cols=4)
+            layout.addWidget(custom_grid_w)
+        else:
+            custom_btns = {}
+
+        all_btns = {**bw_btns, **custom_btns}
+        _sync_btns(all_btns, init_tags)
+
+        tags_edit.textChanged.connect(lambda t: _sync_btns(all_btns, t))
+        for tag, btn in all_btns.items():
+            btn.toggled.connect(lambda checked, t=tag: _on_tag_toggled(t, checked, tags_edit, all_btns))
+
+        # BPM + Key row
+        bk_row = QHBoxLayout()
+        bk_row.setSpacing(12)
+        bpm_col = QVBoxLayout()
+        bpm_col.addWidget(_lbl("BPM"))
+        bpm_edit = _field("0", str(init_bpm) if init_bpm else "")
+        bpm_col.addWidget(bpm_edit)
+        key_col = QVBoxLayout()
+        key_col.addWidget(_lbl("KEY"))
+        key_edit = _field("Am", init_key)
+        key_col.addWidget(key_edit)
+        bk_row.addLayout(bpm_col)
+        bk_row.addLayout(key_col)
+        layout.addLayout(bk_row)
+
+        # Label
+        layout.addWidget(_lbl("GROUP / LABEL"))
+        label_edit = _field("e.g. Loopmasters", init_label)
+        layout.addWidget(label_edit)
+
+        # Buttons
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(dlg.reject)
+        save_btn = QPushButton("Save & Retag")
+        save_btn.setStyleSheet(
+            "QPushButton { background:#C86000; border-color:#E07010; color:#fff;"
+            " border-radius:5px; padding:5px 16px; font-size:13px; }"
+            "QPushButton:hover { background:#E07010; }"
+        )
+        save_btn.clicked.connect(dlg.accept)
+        btn_row.addWidget(cancel_btn)
+        btn_row.addWidget(save_btn)
+        layout.addLayout(btn_row)
+
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        # Build updated metadata
+        new_tags  = tags_edit.text().strip()
+        new_bpm   = int(bpm_edit.text().strip() or 0)
+        new_key   = key_edit.text().strip()
+        new_label = label_edit.text().strip()
+        new_name  = name_edit.text().strip() if name_edit else None
+        new_cat   = cat_combo.currentText()
+        # For single file we accept a user-edited name; for multi keep each file's own name
+        use_new_name = bool(name_edit and new_name)
+
+        # Update DB and retag each file (moving to new category folder if changed)
+        jobs = []
+        for i, p in enumerate(paths):
+            rec = records[i]
+            if not rec:
+                continue
+
+            old_cat    = rec.get("category", "")
+            final_path = p
+            final_name = new_name if use_new_name else rec.get("name", "")
+
+            # ── Relocate when category changed ────────────────────────────────
+            if self.library_root and new_cat and new_cat != old_cat:
+                label_sub = (
+                    new_label.strip().replace(" ", "-")
+                    if self.label_subfolder_check.isChecked() and new_label.strip()
+                    else ""
+                )
+                num = count_existing_files(self.library_root, new_cat, label_sub) + 1
+                ext = Path(p).suffix
+                new_stem = build_filename_from_format(
+                    tokens=self._format_tokens,
+                    separator=self._format_separator,
+                    name=final_name,
+                    tags=new_tags,
+                    bpm=new_bpm,
+                    key=new_key,
+                    category=new_cat,
+                    label=new_label,
+                    number=num,
+                )
+                if not new_stem:
+                    new_stem = final_name or Path(p).stem
+                raw_target = get_target_path(
+                    self.library_root, new_cat, new_stem + ext,
+                    label_subfolder=label_sub,
+                )
+                dest = unique_path(raw_target)
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(p), str(dest))
+                final_path = str(dest)
+                final_name = dest.stem
+
+            meta = {
+                "name":         final_name,
+                "category":     new_cat if new_cat else old_cat,
+                "tags":         new_tags,
+                "bpm":          new_bpm,
+                "key":          new_key,
+                "label":        new_label,
+                "library_path": final_path,
+            }
+            self.db.update_sample_tags(rec["id"], meta)
+            jobs.append((final_path, meta))
+
+        if not jobs:
+            return
+
+        # Retag files in background; refresh tree so any relocation is reflected
+        worker = _LibraryRetagWorker(jobs)
+        worker.finished.connect(lambda n: (
+            self.status_bar.showMessage(f"Retagged {n} file(s) successfully.", 4000),
+            self._refresh_tree(),
+        ))
+        worker.error.connect(lambda e: self.status_bar.showMessage(f"Retag error: {e}", 6000))
+        worker.start()
+        self._lib_retag_worker = worker  # keep reference
 
     # ── Queue ─────────────────────────────────────────────────────────────────
 
@@ -1269,23 +1605,25 @@ class MainWindow(QMainWindow):
             self._custom_grid.addWidget(btn, i // cols, i % cols)
 
     def _open_custom_tags_dialog(self):
-        """Open a simple dialog to edit the custom tag list."""
+        """Open a simple text editor to define custom quick-tag buttons."""
+        from PySide6.QtWidgets import QPlainTextEdit
+
         dlg = QDialog(self)
         dlg.setWindowTitle("Edit Custom Tags")
-        dlg.setMinimumWidth(420)
+        dlg.setMinimumWidth(380)
         dlg.setStyleSheet(self.styleSheet())
         layout = QVBoxLayout(dlg)
         layout.setSpacing(10)
 
-        lbl = QLabel("Enter custom tags, one per line.\n"
-                      "These appear in Bitwig's tag browser below the standard 16 tags.")
+        lbl = QLabel("Enter your custom tags, one per line.\n"
+                     "These appear as quick-tag buttons and are written to file\n"
+                     "metadata for search in Bitwig and other DAWs.")
         lbl.setStyleSheet("color: #999; font-size: 12px;")
         lbl.setWordWrap(True)
         layout.addWidget(lbl)
 
-        from PySide6.QtWidgets import QPlainTextEdit
         text_edit = QPlainTextEdit()
-        text_edit.setPlaceholderText("808\n909\ndetuned\nwet\n...")
+        text_edit.setPlaceholderText("808\n909\ncrispy\nmy-label\n...")
         text_edit.setPlainText("\n".join(self._custom_tags))
         text_edit.setStyleSheet(
             "QPlainTextEdit { background: #2a2a2a; border: 1px solid #444; "
@@ -1301,11 +1639,9 @@ class MainWindow(QMainWindow):
 
         if dlg.exec() == QDialog.Accepted:
             tags = [t.strip().lower() for t in text_edit.toPlainText().splitlines() if t.strip()]
-            # Deduplicate while preserving order
-            seen: set[str] = set()
-            unique = [t for t in tags if not (t in seen or seen.add(t))]
-            self._custom_tags = unique
-            self.db.save_setting("custom_tags", json.dumps(unique))
+            seen: set = set()
+            self._custom_tags = [t for t in tags if not (t in seen or seen.add(t))]
+            self.db.save_setting("custom_tags", json.dumps(self._custom_tags))
             self._rebuild_custom_tag_grid()
 
     def _sync_bitwig_buttons(self, tags_text: str):
@@ -1442,7 +1778,12 @@ class MainWindow(QMainWindow):
                 "metadata": {
                     "name":     item["name"],
                     "category": item["category"],
-                    "tags":     item["tags"],
+                    # Write tags to metadata if force_id3_tags is on, OR if
+                    # the Tags token is included in the active naming format
+                    # (in which case they're already in the filename anyway).
+                    "tags":     item["tags"] if (
+                        self._force_id3_tags or "tags" in self._format_tokens
+                    ) else "",
                     "bpm":      item.get("bpm", 0),
                     "key":      item.get("key", ""),
                     "label":    item.get("label", ""),

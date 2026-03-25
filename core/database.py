@@ -72,5 +72,31 @@ class Database:
         )
         self.conn.commit()
 
+    def get_sample_by_path(self, library_path: str):
+        """Return the sample record matching library_path, or None if not found."""
+        row = self.conn.execute(
+            "SELECT * FROM samples WHERE library_path = ?", (library_path,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def update_sample_tags(self, sample_id: int, meta: dict):
+        """Update name, category, tags, bpm, key, label, library_path for a sample by id."""
+        self.conn.execute(
+            """UPDATE samples
+               SET name=?, category=?, tags=?, bpm=?, key=?, label=?, library_path=?
+               WHERE id=?""",
+            (
+                meta.get("name", ""),
+                meta.get("category", ""),
+                meta.get("tags", ""),
+                meta.get("bpm", 0),
+                meta.get("key", ""),
+                meta.get("label", ""),
+                meta.get("library_path", ""),
+                sample_id,
+            ),
+        )
+        self.conn.commit()
+
     def close(self):
         self.conn.close()

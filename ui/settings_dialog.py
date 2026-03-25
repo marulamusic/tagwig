@@ -5,12 +5,13 @@ from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QListWidget, QListWidgetItem, QComboBox, QFrame,
     QAbstractItemView, QDialogButtonBox, QSizePolicy, QRadioButton,
-    QButtonGroup, QGroupBox,
+    QButtonGroup, QGroupBox, QMessageBox,
 )
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QFont
 
 from core.organizer import build_filename_from_format
+from core.bitwig_tags import register_tags, tags_in_bitwig, get_bitwig_index_dir
 
 
 # ── Token definitions ─────────────────────────────────────────────────────────
@@ -102,19 +103,22 @@ class TokenChip(QPushButton):
 
 
 class SettingsDialog(QDialog):
-    # tokens list, separator char, output format key ('aif'/'wav'/'flac')
-    format_saved = Signal(list, str, str)
+    # tokens list, separator char, output format key, force_id3_tags bool
+    format_saved = Signal(list, str, str, bool)
 
     def __init__(self, current_tokens: list, current_separator: str,
-                 current_format: str = "aif", parent=None):
+                 current_format: str = "aif", custom_tags: list | None = None,
+                 force_id3_tags: bool = True, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Settings")
-        self.setMinimumWidth(620)
+        self.setMinimumWidth(640)
         self.setModal(True)
 
         self._active_tokens: list[str] = list(current_tokens)
         self._separator: str = current_separator
         self._output_format: str = current_format
+        self._custom_tags: list[str] = custom_tags or []
+        self._force_id3_tags: bool = force_id3_tags
         self._chips: dict[str, TokenChip] = {}
         self._format_radios: dict[str, QRadioButton] = {}
 
@@ -122,6 +126,7 @@ class SettingsDialog(QDialog):
         self._populate_active_list()
         self._refresh_chips()
         self._refresh_preview()
+        self._refresh_bitwig_status()
 
         self.setStyleSheet("""
             QDialog, QWidget { background-color: #1c1c1c; color: #e0e0e0;
@@ -194,6 +199,30 @@ class SettingsDialog(QDialog):
             row.addStretch()
             fmt_layout.addLayout(row)
 
+        # Divider
+        div = QFrame()
+        div.setFrameShape(QFrame.HLine)
+        div.setStyleSheet("color: #333;")
+        fmt_layout.addWidget(div)
+
+        # ID3 tags checkbox
+        from PySide6.QtWidgets import QCheckBox
+        self._id3_chk = QCheckBox("Always write all tags to file metadata (ID3 / Vorbis)")
+        self._id3_chk.setChecked(self._force_id3_tags)
+        self._id3_chk.setToolTip(
+            "When enabled, all assigned tags are written to the file's embedded metadata\n"
+            "(TCON for AIFF/WAV, Vorbis comments for FLAC) even if the Tags token is not\n"
+            "included in the filename format.\n\n"
+            "Useful for shorter filenames while keeping full tag metadata for DAW search."
+        )
+        self._id3_chk.setStyleSheet(
+            "QCheckBox { color: #ccc; spacing: 8px; }"
+            "QCheckBox::indicator { width: 14px; height: 14px; }"
+            "QCheckBox::indicator:checked { background: #C86000; border: 1px solid #E07010; border-radius: 2px; }"
+            "QCheckBox::indicator:unchecked { background: #2a2a2a; border: 1px solid #555; border-radius: 2px; }"
+        )
+        fmt_layout.addWidget(self._id3_chk)
+
         layout.addWidget(fmt_group)
 
         # ── Naming Format ──────────────────────────────────────────────────
@@ -245,6 +274,34 @@ class SettingsDialog(QDialog):
         naming_layout.addWidget(self.preview_label)
 
         layout.addWidget(naming_group)
+
+        # ── Bitwig Integration ─────────────────────────────────────────────
+        bw_group = QGroupBox("BITWIG INTEGRATION")
+        bw_layout = QVBoxLayout(bw_group)
+        bw_layout.setSpacing(10)
+
+        bw_desc = QLabel(
+            "Bitwig discovers browsable tags from filenames. Tags must also be "
+            "registered in Bitwig's internal index to appear in the browser. "
+            "Standard tags (808, 909, 707, analog, bright…) are already registered. "
+            "Click below to register any new custom tags you've created in TagWig."
+        )
+        bw_desc.setWordWrap(True)
+        bw_desc.setStyleSheet("color: #777; font-size: 11px;")
+        bw_layout.addWidget(bw_desc)
+
+        bw_row = QHBoxLayout()
+        self._bw_status_lbl = QLabel()
+        self._bw_status_lbl.setStyleSheet("font-size: 11px; color: #888;")
+        self._bw_status_lbl.setWordWrap(True)
+        bw_row.addWidget(self._bw_status_lbl, 1)
+
+        self._bw_register_btn = QPushButton("Register Tags with Bitwig")
+        self._bw_register_btn.clicked.connect(self._register_bitwig_tags)
+        bw_row.addWidget(self._bw_register_btn)
+        bw_layout.addLayout(bw_row)
+
+        layout.addWidget(bw_group)
 
         # ── Buttons ────────────────────────────────────────────────────────
         btn_row = QHBoxLayout()
@@ -337,8 +394,56 @@ class SettingsDialog(QDialog):
 
     def _save(self):
         self._sync_active_tokens()
-        self.format_saved.emit(self._active_tokens, self._separator, self._output_format)
+        self.format_saved.emit(
+            self._active_tokens, self._separator,
+            self._output_format, self._id3_chk.isChecked(),
+        )
         self.accept()
+
+    # ── Bitwig integration ────────────────────────────────────────────────────
+
+    def _refresh_bitwig_status(self):
+        """Update the Bitwig status label based on current custom tags."""
+        if not get_bitwig_index_dir():
+            self._bw_status_lbl.setText("⚠  Bitwig index not found.")
+            self._bw_register_btn.setEnabled(False)
+            return
+
+        if not self._custom_tags:
+            self._bw_status_lbl.setText("No custom tags defined.")
+            self._bw_register_btn.setEnabled(False)
+            return
+
+        status = tags_in_bitwig(self._custom_tags)
+        missing = [t for t, registered in status.items() if not registered]
+
+        if not missing:
+            self._bw_status_lbl.setText(
+                f"✓  All {len(self._custom_tags)} custom tags are registered with Bitwig."
+            )
+            self._bw_register_btn.setEnabled(False)
+        else:
+            self._bw_status_lbl.setText(
+                f"{len(missing)} tag(s) not yet registered: "
+                + ", ".join(missing[:8])
+                + ("…" if len(missing) > 8 else "")
+            )
+            self._bw_register_btn.setEnabled(True)
+
+    def _register_bitwig_tags(self):
+        """Append missing custom tags to Bitwig's tags.ids and file-name-words.ids."""
+        newly_added, err = register_tags(self._custom_tags)
+        if err:
+            QMessageBox.warning(self, "Bitwig Registration Failed", err)
+            return
+        if newly_added:
+            names = ", ".join(newly_added)
+            QMessageBox.information(
+                self, "Tags Registered",
+                f"Registered {len(newly_added)} new tag(s) with Bitwig:\n{names}\n\n"
+                "Rescan your sample library in Bitwig to see the new browsable tags.",
+            )
+        self._refresh_bitwig_status()
 
 
 # Backward-compat alias
