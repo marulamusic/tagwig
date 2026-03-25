@@ -18,8 +18,6 @@ ENV/
 # ── App build output ──────────────────────────────────────────────────────────
 *.app/
 *.dmg
-*.exe
-*.spec
 
 # ── User data (database lives in ~/.sampletool, not the project) ──────────────
 *.db
